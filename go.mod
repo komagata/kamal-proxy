@@ -4,7 +4,6 @@ go 1.27.0
 
 require (
 	github.com/coder/websocket v1.8.12
-	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/quic-go/quic-go v0.60.0
 	github.com/spf13/cobra v1.10.2
