@@ -1,4 +1,4 @@
-.PHONY: build test bench docker
+.PHONY: build test lint check bench docker
 
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/ ./cmd/...
@@ -8,6 +8,11 @@ test:
 
 lint:
 	golangci-lint run
+	go fix -diff ./...
+
+check:
+	go vet ./...
+	govulncheck ./...
 
 bench:
 	go test -bench=. -benchmem -run=^# ./...
