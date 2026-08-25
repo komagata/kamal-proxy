@@ -62,6 +62,11 @@ type RolloutStopArgs struct {
 	Service string
 }
 
+type RolloutRemoveArgs struct {
+	Service      string
+	DrainTimeout time.Duration
+}
+
 type ListResponse struct {
 	Targets ServiceDescriptionMap `json:"services"`
 }
@@ -148,4 +153,8 @@ func (h *CommandHandler) RolloutSet(args RolloutSetArgs, reply *bool) error {
 
 func (h *CommandHandler) RolloutStop(args RolloutStopArgs, reply *bool) error {
 	return h.router.StopRollout(args.Service)
+}
+
+func (h *CommandHandler) RolloutRemove(args RolloutRemoveArgs, reply *bool) error {
+	return h.router.RemoveRolloutTargets(args.Service, args.DrainTimeout)
 }

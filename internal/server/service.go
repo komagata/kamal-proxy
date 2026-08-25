@@ -226,9 +226,11 @@ func (s *Service) UpdateOptions(options ServiceOptions, targetOptions TargetOpti
 }
 
 func (s *Service) Dispose() {
-	s.active.Dispose()
-	if s.rollout != nil {
-		s.rollout.Dispose()
+	active, rollout := s.loadBalancers()
+
+	active.Dispose()
+	if rollout != nil {
+		rollout.Dispose()
 	}
 }
 
@@ -271,6 +273,21 @@ func (s *Service) StopRollout() error {
 	return nil
 }
 
+func (s *Service) RemoveRollout() (*LoadBalancer, error) {
+	s.serviceLock.Lock()
+	defer s.serviceLock.Unlock()
+
+	if s.rollout == nil {
+		return nil, ErrorRolloutTargetNotSet
+	}
+
+	removed := s.rollout
+	s.rollout = nil
+	s.rolloutController = nil
+	slog.Info("Removed rollout targets", "service", s.name)
+	return removed, nil
+}
+
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.options.ShouldExcludeMetrics(r) {
 		LoggingRequestContext(r).ExcludeMetrics = true
@@ -300,23 +317,27 @@ type marshalledService struct {
 }
 
 func (s *Service) MarshalJSON() ([]byte, error) {
+	s.serviceLock.RLock()
+	active, rollout, rolloutController := s.active, s.rollout, s.rolloutController
+	s.serviceLock.RUnlock()
+
 	var rolloutTargets []string
 	var rolloutReaders []string
-	if s.rollout != nil {
-		rolloutTargets = s.rollout.WriteTargets().Names()
-		rolloutReaders = s.rollout.ReadTargets().Names()
+	if rollout != nil {
+		rolloutTargets = rollout.WriteTargets().Names()
+		rolloutReaders = rollout.ReadTargets().Names()
 	}
 
 	return json.Marshal(marshalledService{
 		Name:              s.name,
-		ActiveTargets:     s.active.WriteTargets().Names(),
-		ActiveReaders:     s.active.ReadTargets().Names(),
+		ActiveTargets:     active.WriteTargets().Names(),
+		ActiveReaders:     active.ReadTargets().Names(),
 		RolloutTargets:    rolloutTargets,
 		RolloutReaders:    rolloutReaders,
 		Options:           s.options,
 		TargetOptions:     s.targetOptions,
 		PauseController:   s.pauseController,
-		RolloutController: s.rolloutController,
+		RolloutController: rolloutController,
 	})
 }
 
@@ -423,16 +444,25 @@ func (s *Service) initialize(options ServiceOptions, targetOptions TargetOptions
 }
 
 func (s *Service) Drain(timeout time.Duration) {
+	active, rollout := s.loadBalancers()
+
 	PerformConcurrently(
 		func() {
-			s.active.DrainAll(timeout)
+			active.DrainAll(timeout)
 		},
 		func() {
-			if s.rollout != nil {
-				s.rollout.DrainAll(timeout)
+			if rollout != nil {
+				rollout.DrainAll(timeout)
 			}
 		},
 	)
+}
+
+func (s *Service) loadBalancers() (active, rollout *LoadBalancer) {
+	s.serviceLock.RLock()
+	defer s.serviceLock.RUnlock()
+
+	return s.active, s.rollout
 }
 
 func (s *Service) loadBalancerForRequest(req *http.Request) *LoadBalancer {
