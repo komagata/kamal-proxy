@@ -185,7 +185,7 @@ func (r *Router) SetRolloutSplit(name string, percent int, allowList []string) e
 	return service.SetRolloutSplit(percent, allowList)
 }
 
-func (r *Router) StopRollout(name string) error {
+func (r *Router) EnableRollout(name string) error {
 	defer r.saveStateSnapshot()
 
 	service := r.serviceForName(name)
@@ -193,7 +193,18 @@ func (r *Router) StopRollout(name string) error {
 		return ErrorServiceNotFound
 	}
 
-	return service.StopRollout()
+	return service.EnableRollout()
+}
+
+func (r *Router) DisableRollout(name string) error {
+	defer r.saveStateSnapshot()
+
+	service := r.serviceForName(name)
+	if service == nil {
+		return ErrorServiceNotFound
+	}
+
+	return service.DisableRollout()
 }
 
 func (r *Router) RemoveRolloutTargets(name string, drainTimeout time.Duration) error {

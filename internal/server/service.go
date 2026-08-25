@@ -259,18 +259,37 @@ func (s *Service) SetRolloutSplit(percentage int, allowlist []string) error {
 		return ErrorRolloutTargetNotSet
 	}
 
-	s.rolloutController = NewRolloutController(percentage, allowlist)
+	s.rolloutController = s.currentRolloutController().WithSplit(percentage, allowlist)
 	slog.Info("Set rollout split", "service", s.name, "percentage", percentage, "allowlist", allowlist)
 	return nil
 }
 
-func (s *Service) StopRollout() error {
+func (s *Service) EnableRollout() error {
+	return s.setRolloutEnabled(true)
+}
+
+func (s *Service) DisableRollout() error {
+	return s.setRolloutEnabled(false)
+}
+
+func (s *Service) setRolloutEnabled(enabled bool) error {
 	s.serviceLock.Lock()
 	defer s.serviceLock.Unlock()
 
-	s.rolloutController = nil
-	slog.Info("Stopped rollout", "service", s.name)
+	if s.rollout == nil {
+		return ErrorRolloutTargetNotSet
+	}
+
+	s.rolloutController = s.currentRolloutController().WithEnabled(enabled)
+	slog.Info("Set rollout state", "service", s.name, "enabled", enabled)
 	return nil
+}
+
+func (s *Service) currentRolloutController() *RolloutController {
+	if s.rolloutController == nil {
+		return NewRolloutController(0, []string{})
+	}
+	return s.rolloutController
 }
 
 func (s *Service) RemoveRollout() (*LoadBalancer, error) {

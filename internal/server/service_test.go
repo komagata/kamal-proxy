@@ -274,6 +274,7 @@ func TestService_MarshallingState(t *testing.T) {
 	service.UpdateLoadBalancer(NewLoadBalancer(service.active.Targets(), DefaultWriterAffinityTimeout, false), TargetSlotRollout)
 
 	require.NoError(t, service.SetRolloutSplit(20, []string{"first"}))
+	require.NoError(t, service.EnableRollout())
 
 	var buf bytes.Buffer
 	err := json.NewEncoder(&buf).Encode(service)
@@ -293,6 +294,7 @@ func TestService_MarshallingState(t *testing.T) {
 
 	assert.Equal(t, 20, service2.rolloutController.Percentage)
 	assert.Equal(t, []string{"first"}, service2.rolloutController.Allowlist)
+	assert.True(t, service2.rolloutController.Enabled)
 }
 
 func TestService_MarshallingStateAfterRemovingRollout(t *testing.T) {
