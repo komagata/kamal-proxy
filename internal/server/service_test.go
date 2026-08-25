@@ -316,6 +316,30 @@ func TestService_MarshallingStateAfterRemovingRollout(t *testing.T) {
 	assert.Nil(t, service2.rolloutController)
 }
 
+func TestService_RemovingRolloutWhileDrainingAndMarshalling(t *testing.T) {
+	service := testCreateService(t, defaultServiceOptions, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+
+	for range 50 {
+		targets, err := NewTargetList(nil, nil, defaultTargetOptions)
+		require.NoError(t, err)
+		service.UpdateLoadBalancer(NewLoadBalancer(targets, DefaultWriterAffinityTimeout, false), TargetSlotRollout)
+
+		PerformConcurrently(
+			func() { service.Drain(time.Second) },
+			func() { service.Dispose() },
+			func() { _, _ = json.Marshal(service) },
+			func() {
+				removed, err := service.RemoveRollout()
+				require.NoError(t, err)
+				removed.Dispose()
+			},
+		)
+	}
+
+	assert.Nil(t, service.rollout)
+}
+
 func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
 	state := `
 	  {
