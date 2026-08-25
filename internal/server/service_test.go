@@ -295,6 +295,27 @@ func TestService_MarshallingState(t *testing.T) {
 	assert.Equal(t, []string{"first"}, service2.rolloutController.Allowlist)
 }
 
+func TestService_MarshallingStateAfterRemovingRollout(t *testing.T) {
+	service := testCreateService(t, defaultServiceOptions, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	service.UpdateLoadBalancer(NewLoadBalancer(service.active.Targets(), DefaultWriterAffinityTimeout, false), TargetSlotRollout)
+	require.NoError(t, service.SetRolloutSplit(20, []string{"first"}))
+
+	removed, err := service.RemoveRollout()
+	require.NoError(t, err)
+	removed.Dispose()
+
+	var buf bytes.Buffer
+	require.NoError(t, json.NewEncoder(&buf).Encode(service))
+
+	var service2 Service
+	require.NoError(t, json.NewDecoder(&buf).Decode(&service2))
+	t.Cleanup(service2.Dispose)
+
+	assert.Nil(t, service2.rollout)
+	assert.Nil(t, service2.rolloutController)
+}
+
 func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
 	state := `
 	  {

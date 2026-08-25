@@ -271,6 +271,21 @@ func (s *Service) StopRollout() error {
 	return nil
 }
 
+func (s *Service) RemoveRollout() (*LoadBalancer, error) {
+	s.serviceLock.Lock()
+	defer s.serviceLock.Unlock()
+
+	if s.rollout == nil {
+		return nil, ErrorRolloutTargetNotSet
+	}
+
+	removed := s.rollout
+	s.rollout = nil
+	s.rolloutController = nil
+	slog.Info("Removed rollout targets", "service", s.name)
+	return removed, nil
+}
+
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.options.ShouldExcludeMetrics(r) {
 		LoggingRequestContext(r).ExcludeMetrics = true

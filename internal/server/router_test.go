@@ -760,6 +760,34 @@ func TestRouter_EnablingRollout(t *testing.T) {
 	checkResponse("first")
 }
 
+func TestRouter_RemovingRollout(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+	_, second := testBackend(t, "second", http.StatusOK)
+
+	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.RemoveRolloutTargets("service1", DefaultDrainTimeout))
+	assert.Equal(t, ErrorServiceNotFound, router.RemoveRolloutTargets("service2", DefaultDrainTimeout))
+
+	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
+	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+
+	checkResponse := func(expected string) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.AddCookie(&http.Cookie{Name: "kamal-rollout", Value: "1"})
+		statusCode, body := sendRequest(router, req)
+		assert.Equal(t, http.StatusOK, statusCode)
+		assert.Equal(t, expected, body)
+	}
+
+	checkResponse("second")
+
+	require.NoError(t, router.RemoveRolloutTargets("service1", DefaultDrainTimeout))
+	checkResponse("first")
+
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.SetRolloutSplit("service1", 0, []string{"1"}))
+}
+
 func TestRouter_RestoreLastSavedState(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 

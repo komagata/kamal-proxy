@@ -196,6 +196,25 @@ func (r *Router) StopRollout(name string) error {
 	return service.StopRollout()
 }
 
+func (r *Router) RemoveRolloutTargets(name string, drainTimeout time.Duration) error {
+	service := r.serviceForName(name)
+	if service == nil {
+		return ErrorServiceNotFound
+	}
+
+	removed, err := service.RemoveRollout()
+	if err != nil {
+		return err
+	}
+
+	_ = r.saveStateSnapshot()
+
+	removed.Dispose()
+	removed.DrainAll(drainTimeout)
+
+	return nil
+}
+
 func (r *Router) RemoveService(name string) error {
 	defer r.saveStateSnapshot()
 
