@@ -15,7 +15,8 @@ func newRolloutCommand() *rolloutCommand {
 
 	rolloutCommand.cmd.AddCommand(newRolloutDeployCommand().cmd)
 	rolloutCommand.cmd.AddCommand(newRolloutSetCommand().cmd)
-	rolloutCommand.cmd.AddCommand(newRolloutStopCommand().cmd)
+	rolloutCommand.cmd.AddCommand(newRolloutEnableCommand().cmd)
+	rolloutCommand.cmd.AddCommand(newRolloutDisableCommand().cmd)
 	rolloutCommand.cmd.AddCommand(newRolloutRemoveCommand().cmd)
 
 	return rolloutCommand

@@ -12,6 +12,7 @@ type RolloutController struct {
 	Percentage           int      `json:"percentage"`
 	PercentageSplitPoint float64  `json:"percentage_split_point"`
 	Allowlist            []string `json:"allowlist"`
+	Enabled              bool     `json:"enabled"`
 }
 
 func NewRolloutController(percentage int, allowlist []string) *RolloutController {
@@ -24,7 +25,23 @@ func NewRolloutController(percentage int, allowlist []string) *RolloutController
 	}
 }
 
+func (rc *RolloutController) WithSplit(percentage int, allowlist []string) *RolloutController {
+	updated := NewRolloutController(percentage, allowlist)
+	updated.Enabled = rc.Enabled
+	return updated
+}
+
+func (rc *RolloutController) WithEnabled(enabled bool) *RolloutController {
+	updated := *rc
+	updated.Enabled = enabled
+	return &updated
+}
+
 func (rc *RolloutController) RequestUsesRolloutGroup(r *http.Request) bool {
+	if !rc.Enabled {
+		return false
+	}
+
 	splitValue := rc.splitValue(r)
 	if splitValue == "" {
 		return false

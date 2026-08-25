@@ -738,6 +738,13 @@ func TestRouter_EnablingRollout(t *testing.T) {
 	_, second := testBackend(t, "second", http.StatusOK)
 
 	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.EnableRollout("service1"))
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.DisableRollout("service1"))
+	assert.Equal(t, ErrorServiceNotFound, router.EnableRollout("service2"))
+	assert.Equal(t, ErrorServiceNotFound, router.DisableRollout("service2"))
+
 	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
 
 	checkResponse := func(expected string) {
@@ -751,13 +758,45 @@ func TestRouter_EnablingRollout(t *testing.T) {
 	checkResponse("first")
 
 	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	checkResponse("first")
+
+	require.NoError(t, router.EnableRollout("service1"))
+	checkResponse("second")
+
+	require.NoError(t, router.DisableRollout("service1"))
+	checkResponse("first")
+
+	require.NoError(t, router.EnableRollout("service1"))
 	checkResponse("second")
 
 	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"2"}))
 	checkResponse("first")
 
-	require.NoError(t, router.StopRollout("service1"))
+	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	checkResponse("second")
+}
+
+func TestRouter_EnablingRolloutBeforeSettingSplit(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+	_, second := testBackend(t, "second", http.StatusOK)
+
+	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
+
+	checkResponse := func(expected string) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.AddCookie(&http.Cookie{Name: "kamal-rollout", Value: "1"})
+		statusCode, body := sendRequest(router, req)
+		assert.Equal(t, http.StatusOK, statusCode)
+		assert.Equal(t, expected, body)
+	}
+
+	require.NoError(t, router.EnableRollout("service1"))
 	checkResponse("first")
+
+	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	checkResponse("second")
 }
 
 func TestRouter_RemovingRollout(t *testing.T) {
@@ -771,6 +810,7 @@ func TestRouter_RemovingRollout(t *testing.T) {
 
 	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
 	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	require.NoError(t, router.EnableRollout("service1"))
 
 	checkResponse := func(expected string) {
 		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
