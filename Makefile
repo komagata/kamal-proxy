@@ -8,7 +8,6 @@ test:
 
 lint:
 	golangci-lint run
-	go fix -diff ./...
 
 check:
 	go vet ./...
