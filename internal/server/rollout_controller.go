@@ -15,8 +15,7 @@ type RolloutController struct {
 }
 
 func NewRolloutController(percentage int, allowlist []string) *RolloutController {
-	maxHashValue := float64(uint32(0xFFFFFFFF))
-	percentageSplitPoint := maxHashValue * (float64(percentage) / 100.0)
+	percentageSplitPoint := float64(1<<32) * float64(percentage) / 100.0
 
 	return &RolloutController{
 		Percentage:           percentage,
@@ -44,7 +43,7 @@ func (rc *RolloutController) valueInAllowlist(value string) bool {
 
 func (rc *RolloutController) valueInRolloutPercentage(value string) bool {
 	hash := rc.hashForValue(value)
-	return float64(hash) <= rc.PercentageSplitPoint
+	return float64(hash) < rc.PercentageSplitPoint
 }
 
 func (rc *RolloutController) hashForValue(value string) uint32 {
