@@ -1,7 +1,10 @@
 .PHONY: build test lint check bench docker
 
+VERSION ?= $(shell git describe --tags --always --dirty)
+LDFLAGS := -ldflags "-X 'github.com/basecamp/kamal-proxy/internal/version.Version=$(VERSION)'"
+
 build:
-	CGO_ENABLED=0 go build -trimpath -o bin/ ./cmd/...
+	CGO_ENABLED=0 go build -trimpath $(LDFLAGS) -o bin/ ./cmd/...
 
 test:
 	go test ./...

@@ -6,7 +6,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN make
+ARG VERSION=dev
+RUN make build VERSION=$VERSION
 
 FROM ubuntu:noble-20251013 AS base
 

@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/basecamp/kamal-proxy/internal/server"
+	"github.com/basecamp/kamal-proxy/internal/version"
 )
 
 type runCommand struct {
@@ -35,6 +36,7 @@ func newRunCommand() *runCommand {
 
 func (c *runCommand) run(cmd *cobra.Command, args []string) error {
 	c.setLogger()
+	slog.Info("Starting kamal-proxy", "version", version.Version)
 
 	router := server.NewRouter(globalConfig.StatePath())
 	router.RestoreLastSavedState()
