@@ -335,22 +335,58 @@ type marshalledService struct {
 	LegacyPathPrefixes  []string `json:"path_prefixes,omitempty"`
 }
 
+func (s *Service) Describe() ServiceDescription {
+	s.serviceLock.RLock()
+	active, rollout, controller := s.active, s.rollout, s.currentRolloutController()
+	s.serviceLock.RUnlock()
+
+	hosts := make([]string, 0, len(s.options.Hosts))
+	for _, host := range s.options.Hosts {
+		if host == "" {
+			host = "*"
+		}
+		hosts = append(hosts, host)
+	}
+
+	targets, readers := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
+
+	return ServiceDescription{
+		Hosts:        hosts,
+		PathPrefixes: s.options.PathPrefixes,
+		Targets:      targets,
+		ReadTargets:  readers,
+		TLS:          s.options.TLSEnabled,
+		State:        s.pauseController.GetState().String(),
+		Rollout: RolloutDescription{
+			Enabled:     controller.Enabled,
+			Percentage:  controller.Percentage,
+			Allowlist:   controller.Allowlist,
+			Targets:     rolloutTargets,
+			ReadTargets: rolloutReaders,
+		},
+	}
+}
+
+func targetNames(lb *LoadBalancer) (targets, readers []string) {
+	if lb == nil {
+		return nil, nil
+	}
+	return lb.WriteTargets().Names(), lb.ReadTargets().Names()
+}
+
 func (s *Service) MarshalJSON() ([]byte, error) {
 	s.serviceLock.RLock()
 	active, rollout, rolloutController := s.active, s.rollout, s.rolloutController
 	s.serviceLock.RUnlock()
 
-	var rolloutTargets []string
-	var rolloutReaders []string
-	if rollout != nil {
-		rolloutTargets = rollout.WriteTargets().Names()
-		rolloutReaders = rollout.ReadTargets().Names()
-	}
+	activeTargets, activeReaders := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
 
 	return json.Marshal(marshalledService{
 		Name:              s.name,
-		ActiveTargets:     active.WriteTargets().Names(),
-		ActiveReaders:     active.ReadTargets().Names(),
+		ActiveTargets:     activeTargets,
+		ActiveReaders:     activeReaders,
 		RolloutTargets:    rolloutTargets,
 		RolloutReaders:    rolloutReaders,
 		Options:           s.options,
@@ -488,6 +524,7 @@ func (s *Service) loadBalancerForRequest(req *http.Request) *LoadBalancer {
 	lb := s.active
 	if s.rollout != nil && s.rolloutController != nil && s.rolloutController.RequestUsesRolloutGroup(req) {
 		slog.Debug("Using rollout for request", "service", s.name, "path", req.URL.Path)
+		LoggingRequestContext(req).Rollout = true
 		lb = s.rollout
 	}
 

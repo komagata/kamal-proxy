@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -53,14 +54,45 @@ type Router struct {
 }
 
 type ServiceDescription struct {
-	Host   string `json:"host"`
-	Path   string `json:"path"`
-	TLS    bool   `json:"tls"`
-	Target string `json:"target"`
-	State  string `json:"state"`
+	Hosts        nonNullList        `json:"hosts"`
+	PathPrefixes nonNullList        `json:"path_prefixes"`
+	TLS          bool               `json:"tls"`
+	Targets      nonNullList        `json:"targets"`
+	ReadTargets  nonNullList        `json:"read_targets"`
+	State        string             `json:"state"`
+	Rollout      RolloutDescription `json:"rollout"`
+}
+
+func (sd ServiceDescription) DisplayHosts() string {
+	return strings.Join(sd.Hosts, ",")
+}
+
+func (sd ServiceDescription) DisplayPaths() string {
+	return strings.Join(sd.PathPrefixes, ",")
+}
+
+func (sd ServiceDescription) DisplayTargets() string {
+	return strings.Join(slices.Concat(sd.Targets, sd.ReadTargets), ",")
+}
+
+type RolloutDescription struct {
+	Enabled     bool        `json:"enabled"`
+	Percentage  int         `json:"percentage"`
+	Allowlist   nonNullList `json:"allowlist"`
+	Targets     nonNullList `json:"targets"`
+	ReadTargets nonNullList `json:"read_targets"`
 }
 
 type ServiceDescriptionMap map[string]ServiceDescription
+
+type nonNullList []string
+
+func (l nonNullList) MarshalJSON() ([]byte, error) {
+	if l == nil {
+		return []byte("[]"), nil
+	}
+	return json.Marshal([]string(l))
+}
 
 func NewRouter(statePath string) *Router {
 	return &Router{
@@ -281,21 +313,7 @@ func (r *Router) ListActiveServices() ServiceDescriptionMap {
 	r.withReadLock(func() error {
 		for name, service := range r.services.All() {
 			if service.active != nil {
-				host := strings.Join(service.options.Hosts, ",")
-				if host == "" {
-					host = "*"
-				}
-
-				path := strings.Join(service.options.PathPrefixes, ",")
-				target := strings.Join(service.active.Targets().Names(), ",")
-
-				result[name] = ServiceDescription{
-					Host:   host,
-					Path:   path,
-					Target: target,
-					TLS:    service.options.TLSEnabled,
-					State:  service.pauseController.GetState().String(),
-				}
+				result[name] = service.Describe()
 			}
 		}
 		return nil
