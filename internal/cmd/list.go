@@ -43,18 +43,20 @@ func (c *listCommand) run(cmd *cobra.Command, args []string) error {
 
 func (c *listCommand) displayResponse(response server.ListResponse) {
 	table := NewTable()
-	table.AddRow([]string{"Service", "Host", "Path", "Target", "State", "TLS"})
+	table.AddRow([]string{"Service", "Host", "Path", "Target", "State", "TLS", "Rollout"})
 
 	sortedKeys := slices.Sorted(maps.Keys(response.Targets))
 	for _, name := range sortedKeys {
 		service := response.Targets[name]
-		tls := "no"
-		if service.TLS {
-			tls = "yes"
-		}
-
-		table.AddRow([]string{name, service.Host, service.Path, service.Target, service.State, tls})
+		table.AddRow([]string{name, service.Host, service.Path, service.Target, service.State, yesNo(service.TLS), yesNo(service.Rollout)})
 	}
 
 	table.Print()
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "yes"
+	}
+	return "no"
 }

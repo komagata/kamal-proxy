@@ -53,11 +53,12 @@ type Router struct {
 }
 
 type ServiceDescription struct {
-	Host   string `json:"host"`
-	Path   string `json:"path"`
-	TLS    bool   `json:"tls"`
-	Target string `json:"target"`
-	State  string `json:"state"`
+	Host    string `json:"host"`
+	Path    string `json:"path"`
+	TLS     bool   `json:"tls"`
+	Target  string `json:"target"`
+	State   string `json:"state"`
+	Rollout bool   `json:"rollout"`
 }
 
 type ServiceDescriptionMap map[string]ServiceDescription
@@ -281,21 +282,7 @@ func (r *Router) ListActiveServices() ServiceDescriptionMap {
 	r.withReadLock(func() error {
 		for name, service := range r.services.All() {
 			if service.active != nil {
-				host := strings.Join(service.options.Hosts, ",")
-				if host == "" {
-					host = "*"
-				}
-
-				path := strings.Join(service.options.PathPrefixes, ",")
-				target := strings.Join(service.active.Targets().Names(), ",")
-
-				result[name] = ServiceDescription{
-					Host:   host,
-					Path:   path,
-					Target: target,
-					TLS:    service.options.TLSEnabled,
-					State:  service.pauseController.GetState().String(),
-				}
+				result[name] = service.Describe()
 			}
 		}
 		return nil

@@ -335,6 +335,26 @@ type marshalledService struct {
 	LegacyPathPrefixes  []string `json:"path_prefixes,omitempty"`
 }
 
+func (s *Service) Describe() ServiceDescription {
+	s.serviceLock.RLock()
+	active, controller := s.active, s.currentRolloutController()
+	s.serviceLock.RUnlock()
+
+	host := strings.Join(s.options.Hosts, ",")
+	if host == "" {
+		host = "*"
+	}
+
+	return ServiceDescription{
+		Host:    host,
+		Path:    strings.Join(s.options.PathPrefixes, ","),
+		Target:  strings.Join(active.Targets().Names(), ","),
+		TLS:     s.options.TLSEnabled,
+		State:   s.pauseController.GetState().String(),
+		Rollout: controller.Enabled,
+	}
+}
+
 func (s *Service) MarshalJSON() ([]byte, error) {
 	s.serviceLock.RLock()
 	active, rollout, rolloutController := s.active, s.rollout, s.rolloutController

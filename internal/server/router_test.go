@@ -828,6 +828,65 @@ func TestRouter_RemovingRollout(t *testing.T) {
 	assert.Equal(t, ErrorRolloutTargetNotSet, router.SetRolloutSplit("service1", 0, []string{"1"}))
 }
 
+func TestRouter_ListActiveServices(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+	_, second := testBackend(t, "second", http.StatusOK)
+	_, third := testBackend(t, "third", http.StatusOK)
+
+	tlsServiceOptions := defaultServiceOptions
+	tlsServiceOptions.Hosts = []string{"example.com"}
+	tlsServiceOptions.TLSEnabled = true
+	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, tlsServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	pathServiceOptions := defaultServiceOptions
+	pathServiceOptions.PathPrefixes = []string{"/app"}
+	require.NoError(t, router.DeployService("service2", []string{second}, defaultEmptyReaders, pathServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	services := router.ListActiveServices()
+	assert.Len(t, services, 2)
+	assert.Equal(t, ServiceDescription{
+		Host:    "example.com",
+		Path:    "/",
+		Target:  first,
+		TLS:     true,
+		State:   "running",
+		Rollout: false,
+	}, services["service1"])
+	assert.Equal(t, ServiceDescription{
+		Host:    "*",
+		Path:    "/app",
+		Target:  second,
+		TLS:     false,
+		State:   "running",
+		Rollout: false,
+	}, services["service2"])
+
+	require.NoError(t, router.PauseService("service1", time.Second, time.Second))
+
+	services = router.ListActiveServices()
+	assert.Equal(t, "paused", services["service1"].State)
+	assert.Equal(t, "running", services["service2"].State)
+
+	require.NoError(t, router.ResumeService("service1"))
+	require.NoError(t, router.SetRolloutTargets("service2", []string{third}, defaultEmptyReaders, defaultDeploymentOptions))
+
+	services = router.ListActiveServices()
+	assert.False(t, services["service2"].Rollout)
+
+	require.NoError(t, router.EnableRollout("service2"))
+
+	services = router.ListActiveServices()
+	assert.Equal(t, "running", services["service1"].State)
+	assert.False(t, services["service1"].Rollout)
+	assert.True(t, services["service2"].Rollout)
+
+	require.NoError(t, router.DisableRollout("service2"))
+
+	services = router.ListActiveServices()
+	assert.False(t, services["service2"].Rollout)
+}
+
 func TestRouter_RestoreLastSavedState(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 
