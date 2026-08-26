@@ -337,22 +337,42 @@ type marshalledService struct {
 
 func (s *Service) Describe() ServiceDescription {
 	s.serviceLock.RLock()
-	active, controller := s.active, s.currentRolloutController()
+	active, rollout, controller := s.active, s.rollout, s.currentRolloutController()
 	s.serviceLock.RUnlock()
 
-	host := strings.Join(s.options.Hosts, ",")
-	if host == "" {
-		host = "*"
+	hosts := make([]string, 0, len(s.options.Hosts))
+	for _, host := range s.options.Hosts {
+		if host == "" {
+			host = "*"
+		}
+		hosts = append(hosts, host)
 	}
 
+	targets, readers := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
+
 	return ServiceDescription{
-		Host:    host,
-		Path:    strings.Join(s.options.PathPrefixes, ","),
-		Target:  strings.Join(active.Targets().Names(), ","),
-		TLS:     s.options.TLSEnabled,
-		State:   s.pauseController.GetState().String(),
-		Rollout: controller.Enabled,
+		Hosts:        hosts,
+		PathPrefixes: s.options.PathPrefixes,
+		Targets:      targets,
+		ReadTargets:  readers,
+		TLS:          s.options.TLSEnabled,
+		State:        s.pauseController.GetState().String(),
+		Rollout: RolloutDescription{
+			Enabled:     controller.Enabled,
+			Percentage:  controller.Percentage,
+			Allowlist:   controller.Allowlist,
+			Targets:     rolloutTargets,
+			ReadTargets: rolloutReaders,
+		},
 	}
+}
+
+func targetNames(lb *LoadBalancer) (targets, readers []string) {
+	if lb == nil {
+		return nil, nil
+	}
+	return lb.WriteTargets().Names(), lb.ReadTargets().Names()
 }
 
 func (s *Service) MarshalJSON() ([]byte, error) {
@@ -360,17 +380,13 @@ func (s *Service) MarshalJSON() ([]byte, error) {
 	active, rollout, rolloutController := s.active, s.rollout, s.rolloutController
 	s.serviceLock.RUnlock()
 
-	var rolloutTargets []string
-	var rolloutReaders []string
-	if rollout != nil {
-		rolloutTargets = rollout.WriteTargets().Names()
-		rolloutReaders = rollout.ReadTargets().Names()
-	}
+	activeTargets, activeReaders := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
 
 	return json.Marshal(marshalledService{
 		Name:              s.name,
-		ActiveTargets:     active.WriteTargets().Names(),
-		ActiveReaders:     active.ReadTargets().Names(),
+		ActiveTargets:     activeTargets,
+		ActiveReaders:     activeReaders,
 		RolloutTargets:    rolloutTargets,
 		RolloutReaders:    rolloutReaders,
 		Options:           s.options,

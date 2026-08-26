@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/gob"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -833,34 +835,45 @@ func TestRouter_ListActiveServices(t *testing.T) {
 	_, first := testBackend(t, "first", http.StatusOK)
 	_, second := testBackend(t, "second", http.StatusOK)
 	_, third := testBackend(t, "third", http.StatusOK)
+	_, fourth := testBackend(t, "fourth", http.StatusOK)
+
+	_, reader := testBackend(t, "reader", http.StatusOK)
 
 	tlsServiceOptions := defaultServiceOptions
 	tlsServiceOptions.Hosts = []string{"example.com"}
 	tlsServiceOptions.TLSEnabled = true
-	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, tlsServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	require.NoError(t, router.DeployService("service1", []string{first}, []string{reader}, tlsServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
 
 	pathServiceOptions := defaultServiceOptions
 	pathServiceOptions.PathPrefixes = []string{"/app"}
 	require.NoError(t, router.DeployService("service2", []string{second}, defaultEmptyReaders, pathServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
 
+	mixedHostServiceOptions := defaultServiceOptions
+	mixedHostServiceOptions.Hosts = []string{"example.org", ""}
+	require.NoError(t, router.DeployService("service3", []string{fourth}, defaultEmptyReaders, mixedHostServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
 	services := router.ListActiveServices()
-	assert.Len(t, services, 2)
-	assert.Equal(t, ServiceDescription{
-		Host:    "example.com",
-		Path:    "/",
-		Target:  first,
-		TLS:     true,
-		State:   "running",
-		Rollout: false,
-	}, services["service1"])
-	assert.Equal(t, ServiceDescription{
-		Host:    "*",
-		Path:    "/app",
-		Target:  second,
-		TLS:     false,
-		State:   "running",
-		Rollout: false,
-	}, services["service2"])
+	assert.Len(t, services, 3)
+
+	service1 := services["service1"]
+	assert.Equal(t, nonNullList{"example.com"}, service1.Hosts)
+	assert.Equal(t, nonNullList{"/"}, service1.PathPrefixes)
+	assert.Equal(t, nonNullList{first}, service1.Targets)
+	assert.Equal(t, nonNullList{reader}, service1.ReadTargets)
+	assert.True(t, service1.TLS)
+	assert.Equal(t, "running", service1.State)
+	assert.Equal(t, RolloutDescription{Allowlist: nonNullList{}}, service1.Rollout)
+
+	service2 := services["service2"]
+	assert.Equal(t, nonNullList{"*"}, service2.Hosts)
+	assert.Equal(t, nonNullList{"/app"}, service2.PathPrefixes)
+	assert.Equal(t, nonNullList{second}, service2.Targets)
+	assert.Empty(t, service2.ReadTargets)
+	assert.False(t, service2.TLS)
+	assert.Equal(t, "running", service2.State)
+	assert.False(t, service2.Rollout.Enabled)
+
+	assert.Equal(t, nonNullList{"example.org", "*"}, services["service3"].Hosts)
 
 	require.NoError(t, router.PauseService("service1", time.Second, time.Second))
 
@@ -872,19 +885,48 @@ func TestRouter_ListActiveServices(t *testing.T) {
 	require.NoError(t, router.SetRolloutTargets("service2", []string{third}, defaultEmptyReaders, defaultDeploymentOptions))
 
 	services = router.ListActiveServices()
-	assert.False(t, services["service2"].Rollout)
+	assert.Equal(t, nonNullList{third}, services["service2"].Rollout.Targets)
+	assert.False(t, services["service2"].Rollout.Enabled)
 
+	require.NoError(t, router.SetRolloutSplit("service2", 50, []string{"key1"}))
 	require.NoError(t, router.EnableRollout("service2"))
 
 	services = router.ListActiveServices()
 	assert.Equal(t, "running", services["service1"].State)
-	assert.False(t, services["service1"].Rollout)
-	assert.True(t, services["service2"].Rollout)
+	assert.False(t, services["service1"].Rollout.Enabled)
+	assert.Equal(t, RolloutDescription{
+		Enabled:     true,
+		Percentage:  50,
+		Allowlist:   nonNullList{"key1"},
+		Targets:     nonNullList{third},
+		ReadTargets: nonNullList{},
+	}, services["service2"].Rollout)
 
 	require.NoError(t, router.DisableRollout("service2"))
 
 	services = router.ListActiveServices()
-	assert.False(t, services["service2"].Rollout)
+	rollout := services["service2"].Rollout
+	assert.False(t, rollout.Enabled)
+	assert.Equal(t, 50, rollout.Percentage)
+	assert.Equal(t, nonNullList{"key1"}, rollout.Allowlist)
+}
+
+func TestRouter_ListActiveServices_EmptyListsSurviveGobAsJSON(t *testing.T) {
+	router := testRouter(t)
+	_, target := testBackend(t, "first", http.StatusOK)
+	require.NoError(t, router.DeployService("service1", []string{target}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	var buffer bytes.Buffer
+	require.NoError(t, gob.NewEncoder(&buffer).Encode(router.ListActiveServices()))
+
+	var services ServiceDescriptionMap
+	require.NoError(t, gob.NewDecoder(&buffer).Decode(&services))
+
+	output, err := json.Marshal(services)
+	require.NoError(t, err)
+	assert.NotContains(t, string(output), "null")
+	assert.Contains(t, string(output), `"read_targets":[]`)
+	assert.Contains(t, string(output), `"allowlist":[]`)
 }
 
 func TestRouter_RestoreLastSavedState(t *testing.T) {
