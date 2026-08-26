@@ -524,6 +524,7 @@ func (s *Service) loadBalancerForRequest(req *http.Request) *LoadBalancer {
 	lb := s.active
 	if s.rollout != nil && s.rolloutController != nil && s.rolloutController.RequestUsesRolloutGroup(req) {
 		slog.Debug("Using rollout for request", "service", s.name, "path", req.URL.Path)
+		LoggingRequestContext(req).Rollout = true
 		lb = s.rollout
 	}
 

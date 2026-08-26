@@ -20,6 +20,7 @@ var contextKeyRequestContext = contextKey("request-context")
 type loggingRequestContext struct {
 	Service         string
 	Target          string
+	Rollout         bool
 	RequestHeaders  []string
 	ResponseHeaders []string
 	ExcludeMetrics  bool
@@ -87,6 +88,7 @@ func (h *LoggingMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Int("status", writer.statusCode),
 			slog.String("service", loggingRequestContext.Service),
 			slog.String("target", loggingRequestContext.Target),
+			slog.Bool("rollout", loggingRequestContext.Rollout),
 			slog.Int64("duration", elapsed.Nanoseconds()),
 			slog.String("method", r.Method),
 			slog.Int64("req_content_length", r.ContentLength),
@@ -107,7 +109,7 @@ func (h *LoggingMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.LogAttrs(context.Background(), slog.LevelInfo, "Request", attrs...)
 
 		if !loggingRequestContext.ExcludeMetrics {
-			metrics.Tracker.TrackRequest(loggingRequestContext.Service, r.Method, writer.statusCode, elapsed)
+			metrics.Tracker.TrackRequest(loggingRequestContext.Service, r.Method, writer.statusCode, loggingRequestContext.Rollout, elapsed)
 		}
 	}()
 
