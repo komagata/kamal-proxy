@@ -35,6 +35,12 @@ func (h *RequestBufferMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Close the buffer ourselves once the request is done, so the spill file
+	// is always removed. Downstream handlers cannot be relied on to close it:
+	// httputil.ReverseProxy in Go 1.26 wrapped the outbound body so that its
+	// Close was a no-op, and every spilled request left its file behind.
+	defer requestBuffer.Close()
+
 	r.Body = requestBuffer
 	h.next.ServeHTTP(w, r)
 }
