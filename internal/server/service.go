@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -48,6 +49,9 @@ const (
 	DefaultMaxRequestBodySize  = 0
 	DefaultMaxResponseBodySize = 0
 
+	DefaultIdleWakeTimeout      = 30 * time.Second
+	DefaultIdleLifecycleTimeout = 30 * time.Second
+
 	DefaultStopMessage = ""
 )
 
@@ -56,7 +60,21 @@ var (
 	ErrorUnableToLoadErrorPages              = errors.New("unable to load error pages")
 	ErrorAutomaticTLSDoesNotSupportWildcards = errors.New("automatic TLS does not support wildcards")
 	ErrServiceOptionsInvalid                 = errors.New("service options invalid")
+
+	contextKeyInternalRequest = contextKey("internal-request")
 )
+
+// markInternalRequest marks the context as belonging to an internal request:
+// one synthesized inside the proxy itself, such as a TLS on-demand check
+// probe, rather than arriving over a client connection.
+func markInternalRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyInternalRequest, true)
+}
+
+func isInternalRequest(r *http.Request) bool {
+	internal, _ := r.Context().Value(contextKeyInternalRequest).(bool)
+	return internal
+}
 
 type TargetSlot int
 
@@ -85,6 +103,7 @@ type ServiceOptions struct {
 	TLSEnabled                  bool          `json:"tls_enabled"`
 	TLSCertificatePath          string        `json:"tls_certificate_path"`
 	TLSPrivateKeyPath           string        `json:"tls_private_key_path"`
+	TLSOnDemandURL              string        `json:"tls_on_demand_url"`
 	TLSRedirect                 bool          `json:"tls_redirect"`
 	CanonicalHost               string        `json:"canonical_host"`
 	ACMEDirectory               string        `json:"acme_directory"`
@@ -93,18 +112,53 @@ type ServiceOptions struct {
 	StripPrefix                 bool          `json:"strip_prefix"`
 	WriterAffinityTimeout       time.Duration `json:"writer_affinity_timeout"`
 	ReadTargetsAcceptWebsockets bool          `json:"read_targets_accept_websockets"`
+	ExcludeMetricsPaths         []string      `json:"exclude_metrics_paths"`
+	ClientIPHeader              string        `json:"client_ip_header"`
+	IdleTimeout                 time.Duration `json:"idle_timeout"`
+	IdleWakeTimeout             time.Duration `json:"idle_wake_timeout"`
+}
+
+func (so *ServiceOptions) ShouldExcludeMetrics(r *http.Request) bool {
+	return slices.Contains(so.ExcludeMetricsPaths, RoutedTargetPath(r))
 }
 
 func (so *ServiceOptions) Normalize() {
 	so.Hosts = NormalizeHosts(so.Hosts)
 	so.PathPrefixes = NormalizePathPrefixes(so.PathPrefixes)
+	if so.IdleTimeout > 0 && so.IdleWakeTimeout == 0 {
+		so.IdleWakeTimeout = DefaultIdleWakeTimeout
+	}
 }
 
 func (so ServiceOptions) Validate() error {
 	so.Normalize()
 
+	if so.TLSOnDemandURL != "" && !so.TLSEnabled {
+		return fmt.Errorf("%w: TLS must be enabled to use a TLS on-demand URL", ErrServiceOptionsInvalid)
+	}
+
 	if so.TLSEnabled {
-		if !so.HasConfiguredHosts() {
+		if so.TLSOnDemandURL != "" {
+			if so.HasConfiguredHosts() {
+				return fmt.Errorf("%w: cannot set hosts when using a TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+
+			if so.TLSCertificatePath != "" || so.TLSPrivateKeyPath != "" {
+				return fmt.Errorf("%w: cannot use a custom TLS certificate with a TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+
+			if so.CanonicalHost != "" {
+				return fmt.Errorf("%w: cannot set a canonical host when using a TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+
+			if err := validateTLSOnDemandURL(so.TLSOnDemandURL); err != nil {
+				return fmt.Errorf("%w: %w", ErrServiceOptionsInvalid, err)
+			}
+			_, local, _ := parseTLSOnDemandURL(so.TLSOnDemandURL)
+			if so.IdleTimeout > 0 && local {
+				return fmt.Errorf("%w: idle mode cannot be used with a local TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+		} else if !so.HasConfiguredHosts() {
 			return fmt.Errorf("%w: host must be set when using TLS", ErrServiceOptionsInvalid)
 		}
 
@@ -117,6 +171,9 @@ func (so ServiceOptions) Validate() error {
 		if !slices.Contains(so.Hosts, so.CanonicalHost) {
 			return fmt.Errorf("%w: canonical-host '%s' must be present in the hosts list: %v", ErrServiceOptionsInvalid, so.CanonicalHost, so.Hosts)
 		}
+	}
+	if so.IdleTimeout < 0 || so.IdleWakeTimeout < 0 {
+		return fmt.Errorf("%w: idle timeouts cannot be negative", ErrServiceOptionsInvalid)
 	}
 
 	return nil
@@ -161,15 +218,20 @@ type Service struct {
 	serviceLock sync.RWMutex
 
 	pauseController   *PauseController
+	idleController    *IdleController
 	rolloutController *RolloutController
 
-	certManager CertManager
-	middleware  http.Handler
+	lifecycle ContainerLifecycle
+
+	certManager  CertManager
+	middleware   http.Handler
+	stateChanged func()
 }
 
-func NewService(name string, options ServiceOptions, targetOptions TargetOptions) (*Service, error) {
+func NewService(name string, options ServiceOptions, targetOptions TargetOptions, lifecycle ContainerLifecycle) (*Service, error) {
 	service := &Service{
 		name:            name,
+		lifecycle:       lifecycle,
 		pauseController: NewPauseController(),
 	}
 
@@ -184,9 +246,15 @@ func (s *Service) UpdateOptions(options ServiceOptions, targetOptions TargetOpti
 }
 
 func (s *Service) Dispose() {
-	s.active.Dispose()
-	if s.rollout != nil {
-		s.rollout.Dispose()
+	if s.idleController != nil {
+		s.idleController.Close()
+	}
+
+	active, rollout := s.loadBalancers()
+
+	active.Dispose()
+	if rollout != nil {
+		rollout.Dispose()
 	}
 }
 
@@ -199,9 +267,15 @@ func (s *Service) UpdateLoadBalancer(lb *LoadBalancer, slot TargetSlot) *LoadBal
 	if slot == TargetSlotRollout {
 		replaced = s.rollout
 		s.rollout = lb
+		if s.idleController != nil {
+			s.idleController.configure(s.options.IdleTimeout, s.options.IdleWakeTimeout, s.idleContainerNames(), s.lifecycle, s.waitUntilIdleTargetsHealthy)
+		}
 	} else {
 		replaced = s.active
 		s.active = lb
+		if s.idleController != nil {
+			s.idleController.Reset(s.idleContainerNames(), s.waitUntilIdleTargetsHealthy)
+		}
 	}
 
 	return replaced
@@ -215,23 +289,61 @@ func (s *Service) SetRolloutSplit(percentage int, allowlist []string) error {
 		return ErrorRolloutTargetNotSet
 	}
 
-	s.rolloutController = NewRolloutController(percentage, allowlist)
+	s.rolloutController = s.currentRolloutController().WithSplit(percentage, allowlist)
 	slog.Info("Set rollout split", "service", s.name, "percentage", percentage, "allowlist", allowlist)
 	return nil
 }
 
-func (s *Service) StopRollout() error {
+func (s *Service) EnableRollout() error {
+	return s.setRolloutEnabled(true)
+}
+
+func (s *Service) DisableRollout() error {
+	return s.setRolloutEnabled(false)
+}
+
+func (s *Service) setRolloutEnabled(enabled bool) error {
 	s.serviceLock.Lock()
 	defer s.serviceLock.Unlock()
 
-	s.rolloutController = nil
-	slog.Info("Stopped rollout", "service", s.name)
+	if s.rollout == nil {
+		return ErrorRolloutTargetNotSet
+	}
+
+	s.rolloutController = s.currentRolloutController().WithEnabled(enabled)
+	slog.Info("Set rollout state", "service", s.name, "enabled", enabled)
 	return nil
 }
 
+func (s *Service) currentRolloutController() *RolloutController {
+	if s.rolloutController == nil {
+		return NewRolloutController(0, []string{})
+	}
+	return s.rolloutController
+}
+
+func (s *Service) RemoveRollout() (*LoadBalancer, error) {
+	s.serviceLock.Lock()
+	defer s.serviceLock.Unlock()
+
+	if s.rollout == nil {
+		return nil, ErrorRolloutTargetNotSet
+	}
+
+	removed := s.rollout
+	s.rollout = nil
+	s.rolloutController = nil
+	slog.Info("Removed rollout targets", "service", s.name)
+	return removed, nil
+}
+
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	metrics.Tracker.AddInflightRequest(s.name)
-	defer metrics.Tracker.SubtractInflightRequest(s.name)
+	if s.options.ShouldExcludeMetrics(r) {
+		LoggingRequestContext(r).ExcludeMetrics = true
+	} else {
+		metrics.Tracker.AddInflightRequest(s.name)
+		defer metrics.Tracker.SubtractInflightRequest(s.name)
+	}
 
 	s.middleware.ServeHTTP(w, r)
 }
@@ -245,6 +357,7 @@ type marshalledService struct {
 	RolloutTargets    []string           `json:"rollout_targets"`
 	RolloutReaders    []string           `json:"rollout_readers"`
 	PauseController   *PauseController   `json:"pause_controller"`
+	IdleController    *IdleController    `json:"idle_controller"`
 	RolloutController *RolloutController `json:"rollout_controller"`
 
 	LegacyActiveTarget  string   `json:"active_target,omitempty"`
@@ -253,24 +366,71 @@ type marshalledService struct {
 	LegacyPathPrefixes  []string `json:"path_prefixes,omitempty"`
 }
 
-func (s *Service) MarshalJSON() ([]byte, error) {
-	var rolloutTargets []string
-	var rolloutReaders []string
-	if s.rollout != nil {
-		rolloutTargets = s.rollout.WriteTargets().Names()
-		rolloutReaders = s.rollout.ReadTargets().Names()
+func (s *Service) Describe() ServiceDescription {
+	s.serviceLock.RLock()
+	active, rollout, controller := s.active, s.rollout, s.currentRolloutController()
+	s.serviceLock.RUnlock()
+
+	hosts := make([]string, 0, len(s.options.Hosts))
+	for _, host := range s.options.Hosts {
+		if host == "" {
+			host = "*"
+		}
+		hosts = append(hosts, host)
 	}
+
+	targets, readers := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
+	state := s.pauseController.GetState().String()
+	if s.idleController != nil && s.pauseController.GetState() == PauseStateRunning {
+		if idleState := s.idleController.StateValue(); idleState != IdleStateActive {
+			state = idleState.String()
+		}
+	}
+
+	return ServiceDescription{
+		Hosts:        hosts,
+		PathPrefixes: s.options.PathPrefixes,
+		Targets:      targets,
+		ReadTargets:  readers,
+		TLS:          s.options.TLSEnabled,
+		State:        state,
+		Rollout: RolloutDescription{
+			Enabled:     controller.Enabled,
+			Percentage:  controller.Percentage,
+			Allowlist:   controller.Allowlist,
+			Targets:     rolloutTargets,
+			ReadTargets: rolloutReaders,
+		},
+	}
+}
+
+func targetNames(lb *LoadBalancer) (targets, readers []string) {
+	if lb == nil {
+		return nil, nil
+	}
+	return lb.WriteTargets().Names(), lb.ReadTargets().Names()
+}
+
+func (s *Service) MarshalJSON() ([]byte, error) {
+	s.serviceLock.RLock()
+	active, rollout, rolloutController := s.active, s.rollout, s.rolloutController
+	s.serviceLock.RUnlock()
+
+	activeTargets, activeReaders := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
 
 	return json.Marshal(marshalledService{
 		Name:              s.name,
-		ActiveTargets:     s.active.WriteTargets().Names(),
-		ActiveReaders:     s.active.ReadTargets().Names(),
+		ActiveTargets:     activeTargets,
+		ActiveReaders:     activeReaders,
 		RolloutTargets:    rolloutTargets,
 		RolloutReaders:    rolloutReaders,
 		Options:           s.options,
 		TargetOptions:     s.targetOptions,
 		PauseController:   s.pauseController,
-		RolloutController: s.rolloutController,
+		IdleController:    s.idleController,
+		RolloutController: rolloutController,
 	})
 }
 
@@ -298,6 +458,7 @@ func (s *Service) UnmarshalJSON(data []byte) error {
 
 	s.name = ms.Name
 	s.pauseController = ms.PauseController
+	s.idleController = ms.IdleController
 	s.rolloutController = ms.RolloutController
 
 	activeTargets, err := NewTargetList(ms.ActiveTargets, ms.ActiveReaders, ms.TargetOptions)
@@ -320,6 +481,10 @@ func (s *Service) UnmarshalJSON(data []byte) error {
 }
 
 func (s *Service) Stop(drainTimeout time.Duration, message string) error {
+	if s.idleController != nil {
+		s.idleController.Disable()
+	}
+
 	err := s.pauseController.Stop(message)
 	if err != nil {
 		return err
@@ -333,6 +498,10 @@ func (s *Service) Stop(drainTimeout time.Duration, message string) error {
 }
 
 func (s *Service) Pause(drainTimeout time.Duration, pauseTimeout time.Duration) error {
+	if s.idleController != nil {
+		s.idleController.Disable()
+	}
+
 	err := s.pauseController.Pause(pauseTimeout)
 	if err != nil {
 		return err
@@ -346,6 +515,10 @@ func (s *Service) Pause(drainTimeout time.Duration, pauseTimeout time.Duration) 
 }
 
 func (s *Service) Resume() error {
+	if s.idleController != nil {
+		s.idleController.Enable()
+	}
+
 	err := s.pauseController.Resume()
 	if err != nil {
 		return err
@@ -373,26 +546,95 @@ func (s *Service) initialize(options ServiceOptions, targetOptions TargetOptions
 	s.certManager = certManager
 	s.middleware = middleware
 
+	if s.options.IdleTimeout > 0 {
+		if s.idleController == nil {
+			s.idleController = NewIdleController(s.options.IdleTimeout, s.options.IdleWakeTimeout, s.idleContainerNames(), s.lifecycle, s.waitUntilIdleTargetsHealthy)
+		} else {
+			s.idleController.configure(s.options.IdleTimeout, s.options.IdleWakeTimeout, s.idleContainerNames(), s.lifecycle, s.waitUntilIdleTargetsHealthy)
+		}
+		s.idleController.SetPersist(s.stateChanged)
+	} else if s.idleController != nil {
+		s.idleController.Close()
+		s.idleController = nil
+	}
+
+	return nil
+}
+
+func (s *Service) activeContainerNames() []string {
+	if s.active == nil {
+		return nil
+	}
+	names := make([]string, 0, len(s.active.WriteTargets()))
+	for _, target := range s.active.WriteTargets() {
+		names = append(names, target.ContainerName())
+	}
+	return names
+}
+
+func (s *Service) idleContainerNames() []string {
+	names := s.activeContainerNames()
+	if s.rollout != nil {
+		for _, target := range s.rollout.WriteTargets() {
+			names = append(names, target.ContainerName())
+		}
+	}
+	return names
+}
+
+func (s *Service) waitUntilIdleTargetsHealthy(timeout time.Duration) error {
+	s.serviceLock.RLock()
+	loadBalancers := make([]*LoadBalancer, 0, 2)
+	if s.active != nil {
+		loadBalancers = append(loadBalancers, s.active)
+	}
+	if s.rollout != nil {
+		loadBalancers = append(loadBalancers, s.rollout)
+	}
+	s.serviceLock.RUnlock()
+	if len(loadBalancers) == 0 {
+		return ErrorNoHealthyTargets
+	}
+	errs := make(chan error, len(loadBalancers))
+	for _, lb := range loadBalancers {
+		lb.PrepareForWake()
+		go func() { errs <- lb.WaitUntilHealthy(timeout) }()
+	}
+	for range loadBalancers {
+		if err := <-errs; err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (s *Service) Drain(timeout time.Duration) {
+	active, rollout := s.loadBalancers()
+
 	PerformConcurrently(
 		func() {
-			s.active.DrainAll(timeout)
+			active.DrainAll(timeout)
 		},
 		func() {
-			if s.rollout != nil {
-				s.rollout.DrainAll(timeout)
+			if rollout != nil {
+				rollout.DrainAll(timeout)
 			}
 		},
 	)
+}
+
+func (s *Service) loadBalancers() (active, rollout *LoadBalancer) {
+	s.serviceLock.RLock()
+	defer s.serviceLock.RUnlock()
+
+	return s.active, s.rollout
 }
 
 func (s *Service) loadBalancerForRequest(req *http.Request) *LoadBalancer {
 	lb := s.active
 	if s.rollout != nil && s.rolloutController != nil && s.rolloutController.RequestUsesRolloutGroup(req) {
 		slog.Debug("Using rollout for request", "service", s.name, "path", req.URL.Path)
+		LoggingRequestContext(req).Rollout = true
 		lb = s.rollout
 	}
 
@@ -420,12 +662,31 @@ func (s *Service) createCertManager(options ServiceOptions) (CertManager, error)
 		}
 	}
 
+	certCache := autocert.DirCache(options.ScopedCachePath())
+
+	hostPolicy, err := s.createHostPolicy(options, certCache)
+	if err != nil {
+		return nil, err
+	}
+
 	return &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(options.ScopedCachePath()),
-		HostPolicy: autocert.HostWhitelist(options.Hosts...),
+		Cache:      certCache,
+		HostPolicy: hostPolicy,
 		Client:     &acme.Client{DirectoryURL: options.ACMEDirectory},
 	}, nil
+}
+
+func (s *Service) createHostPolicy(options ServiceOptions, certCache autocert.Cache) (autocert.HostPolicy, error) {
+	if options.TLSOnDemandURL != "" {
+		checker, err := newTLSOnDemandChecker(s, options.TLSOnDemandURL, certCache)
+		if err != nil {
+			return nil, err
+		}
+		return checker.hostPolicy(), nil
+	}
+
+	return autocert.HostWhitelist(options.Hosts...), nil
 }
 
 func (s *Service) createMiddleware(options ServiceOptions, certManager CertManager) (http.Handler, error) {
@@ -447,6 +708,10 @@ func (s *Service) createMiddleware(options ServiceOptions, certManager CertManag
 		handler = certManager.HTTPHandler(handler)
 	}
 
+	if options.ClientIPHeader != "" {
+		handler = WithClientIPMiddleware(options.ClientIPHeader, handler)
+	}
+
 	return handler, nil
 }
 
@@ -466,10 +731,48 @@ func (s *Service) serviceRequestWithTarget(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if s.handleIdleHealthCheck(w, r) {
+		return
+	}
+
+	if s.idleController != nil && !isInternalRequest(r) {
+		if err := s.idleController.BeginRequest(r.Context()); err != nil {
+			s.idleController.EndRequest()
+			slog.Error("Rejecting request: service did not wake", "service", s.name, "path", r.URL.Path, "error", err)
+			w.Header().Set("Retry-After", "1")
+			SetErrorResponse(w, r, http.StatusServiceUnavailable, nil)
+			return
+		}
+		defer s.idleController.EndRequest()
+	}
+
 	sendRequest := s.startLoadBalancerRequest(w, r)
 	if sendRequest != nil {
 		sendRequest()
 	}
+}
+
+func (s *Service) handleIdleHealthCheck(w http.ResponseWriter, r *http.Request) bool {
+	if s.idleController == nil {
+		return false
+	}
+
+	if s.targetOptions.IsHealthCheckRequest(r) {
+		// Health checks should not wake the service.
+		// While it is stopping, sleeping, or waking, just return 200.
+		icState := s.idleController.StateValue()
+		if icState != IdleStateActive {
+			if s.idleController.LastWakeError() != nil {
+				SetErrorResponse(w, r, http.StatusServiceUnavailable, nil)
+				return true
+			}
+			w.WriteHeader(http.StatusOK)
+			return true
+		}
+		return false
+	}
+
+	return false
 }
 
 func (s *Service) startLoadBalancerRequest(w http.ResponseWriter, r *http.Request) func() {
@@ -519,28 +822,30 @@ func (s *Service) handleRedirectsIfNeeded(w http.ResponseWriter, r *http.Request
 // TLS redirection or canonical host redirection should occur. If no redirect is
 // needed, it returns an empty string.
 func (s *Service) redirectURLIfNeeded(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
-	}
+	if !isInternalRequest(r) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+		}
 
-	currentScheme := "http"
-	if r.TLS != nil {
-		currentScheme = "https"
-	}
+		currentScheme := "http"
+		if r.TLS != nil {
+			currentScheme = "https"
+		}
 
-	desiredScheme := currentScheme
-	if s.options.TLSEnabled && s.options.TLSRedirect && currentScheme == "http" {
-		desiredScheme = "https"
-	}
+		desiredScheme := currentScheme
+		if s.options.TLSEnabled && s.options.TLSRedirect && currentScheme == "http" {
+			desiredScheme = "https"
+		}
 
-	desiredHost := host
-	if s.options.CanonicalHost != "" && host != s.options.CanonicalHost {
-		desiredHost = s.options.CanonicalHost
-	}
+		desiredHost := host
+		if s.options.CanonicalHost != "" && host != s.options.CanonicalHost {
+			desiredHost = s.options.CanonicalHost
+		}
 
-	if desiredScheme != currentScheme || desiredHost != host {
-		return desiredScheme + "://" + desiredHost + r.URL.RequestURI()
+		if desiredScheme != currentScheme || desiredHost != host {
+			return desiredScheme + "://" + desiredHost + r.URL.RequestURI()
+		}
 	}
 
 	return ""
