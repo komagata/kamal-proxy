@@ -3,11 +3,9 @@ package server
 import (
 	"bufio"
 	"io"
-	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
@@ -94,6 +92,5 @@ func TestRequestBufferMiddleware_RemovesSpillFileWhenRequestEnds(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Result().StatusCode)
 	require.NotEmpty(t, spillFile)
 
-	_, err := os.Stat(spillFile)
-	assert.ErrorIs(t, err, fs.ErrNotExist, "spill file should be removed once the request is done")
+	assert.NoFileExists(t, spillFile, "spill file should be removed once the request is done")
 }
