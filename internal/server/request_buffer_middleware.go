@@ -35,6 +35,10 @@ func (h *RequestBufferMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Close the buffer ourselves once the request is done, so the spill file
+	// is always removed (even if the downstream handler doesn't close it).
+	defer requestBuffer.Close()
+
 	r.Body = requestBuffer
 	h.next.ServeHTTP(w, r)
 }

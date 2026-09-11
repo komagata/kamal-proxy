@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,26 +37,71 @@ func RoutingContext(r *http.Request) *routingContext {
 	return rc
 }
 
+func RoutedTargetPath(r *http.Request) string {
+	path := r.URL.Path
+	if rc := RoutingContext(r); rc != nil {
+		path = strings.TrimPrefix(path, rc.MatchedPrefix)
+		if path == "" {
+			path = rootPath
+		}
+	}
+	return path
+}
+
 type Router struct {
-	statePath   string
-	services    *ServiceMap
-	serviceLock sync.RWMutex
+	statePath    string
+	dockerClient *DockerClient
+	services     *ServiceMap
+	serviceLock  sync.RWMutex
+	stateLock    sync.Mutex
 }
 
 type ServiceDescription struct {
-	Host   string `json:"host"`
-	Path   string `json:"path"`
-	TLS    bool   `json:"tls"`
-	Target string `json:"target"`
-	State  string `json:"state"`
+	Hosts        nonNullList        `json:"hosts"`
+	PathPrefixes nonNullList        `json:"path_prefixes"`
+	TLS          bool               `json:"tls"`
+	Targets      nonNullList        `json:"targets"`
+	ReadTargets  nonNullList        `json:"read_targets"`
+	State        string             `json:"state"`
+	Rollout      RolloutDescription `json:"rollout"`
+}
+
+func (sd ServiceDescription) DisplayHosts() string {
+	return strings.Join(sd.Hosts, ",")
+}
+
+func (sd ServiceDescription) DisplayPaths() string {
+	return strings.Join(sd.PathPrefixes, ",")
+}
+
+func (sd ServiceDescription) DisplayTargets() string {
+	return strings.Join(slices.Concat(sd.Targets, sd.ReadTargets), ",")
+}
+
+type RolloutDescription struct {
+	Enabled     bool        `json:"enabled"`
+	Percentage  int         `json:"percentage"`
+	Allowlist   nonNullList `json:"allowlist"`
+	Targets     nonNullList `json:"targets"`
+	ReadTargets nonNullList `json:"read_targets"`
 }
 
 type ServiceDescriptionMap map[string]ServiceDescription
 
-func NewRouter(statePath string) *Router {
+type nonNullList []string
+
+func (l nonNullList) MarshalJSON() ([]byte, error) {
+	if l == nil {
+		return []byte("[]"), nil
+	}
+	return json.Marshal([]string(l))
+}
+
+func NewRouter(statePath string, dockerSocketPath string) *Router {
 	return &Router{
-		statePath: statePath,
-		services:  NewServiceMap(),
+		statePath:    statePath,
+		dockerClient: NewDockerClient(dockerSocketPath),
+		services:     NewServiceMap(),
 	}
 }
 
@@ -77,17 +124,19 @@ func (r *Router) RestoreLastSavedState() error {
 		return err
 	}
 
-	r.withWriteLock(func() error {
+	return r.withWriteLock(func() error {
 		r.services = NewServiceMap()
 		for _, service := range services {
+			service.lifecycle = r.dockerClient
+			service.stateChanged = func() { _ = r.saveStateSnapshot() }
+			if err := service.initialize(service.options, service.targetOptions); err != nil {
+				return fmt.Errorf("initialize restored service %q: %w", service.name, err)
+			}
 			r.services.Set(service)
 		}
-
+		slog.Info("Restored saved state", "path", r.statePath)
 		return nil
 	})
-
-	slog.Info("Restored saved state", "path", r.statePath)
-	return nil
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -174,7 +223,7 @@ func (r *Router) SetRolloutSplit(name string, percent int, allowList []string) e
 	return service.SetRolloutSplit(percent, allowList)
 }
 
-func (r *Router) StopRollout(name string) error {
+func (r *Router) EnableRollout(name string) error {
 	defer r.saveStateSnapshot()
 
 	service := r.serviceForName(name)
@@ -182,7 +231,37 @@ func (r *Router) StopRollout(name string) error {
 		return ErrorServiceNotFound
 	}
 
-	return service.StopRollout()
+	return service.EnableRollout()
+}
+
+func (r *Router) DisableRollout(name string) error {
+	defer r.saveStateSnapshot()
+
+	service := r.serviceForName(name)
+	if service == nil {
+		return ErrorServiceNotFound
+	}
+
+	return service.DisableRollout()
+}
+
+func (r *Router) RemoveRolloutTargets(name string, drainTimeout time.Duration) error {
+	service := r.serviceForName(name)
+	if service == nil {
+		return ErrorServiceNotFound
+	}
+
+	removed, err := service.RemoveRollout()
+	if err != nil {
+		return err
+	}
+
+	_ = r.saveStateSnapshot()
+
+	removed.Dispose()
+	removed.DrainAll(drainTimeout)
+
+	return nil
 }
 
 func (r *Router) RemoveService(name string) error {
@@ -240,21 +319,7 @@ func (r *Router) ListActiveServices() ServiceDescriptionMap {
 	r.withReadLock(func() error {
 		for name, service := range r.services.All() {
 			if service.active != nil {
-				host := strings.Join(service.options.Hosts, ",")
-				if host == "" {
-					host = "*"
-				}
-
-				path := strings.Join(service.options.PathPrefixes, ",")
-				target := strings.Join(service.active.Targets().Names(), ",")
-
-				result[name] = ServiceDescription{
-					Host:   host,
-					Path:   path,
-					Target: target,
-					TLS:    service.options.TLSEnabled,
-					State:  service.pauseController.GetState().String(),
-				}
+				result[name] = service.Describe()
 			}
 		}
 		return nil
@@ -294,9 +359,17 @@ func (r *Router) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 func (r *Router) createOrUpdateService(name string, options ServiceOptions, targetOptions TargetOptions) (*Service, error) {
 	service := r.services.Get(name)
 	if service == nil {
-		return NewService(name, options, targetOptions)
+		service, err := NewService(name, options, targetOptions, r.dockerClient)
+		if err == nil {
+			service.stateChanged = func() { _ = r.saveStateSnapshot() }
+			if service.idleController != nil {
+				service.idleController.SetPersist(service.stateChanged)
+			}
+		}
+		return service, err
 	}
 
+	service.lifecycle = r.dockerClient
 	err := service.UpdateOptions(options, targetOptions)
 	return service, err
 }
@@ -346,6 +419,8 @@ func (r *Router) installLoadBalancer(name string, slot TargetSlot, lb *LoadBalan
 }
 
 func (r *Router) saveStateSnapshot() error {
+	r.stateLock.Lock()
+	defer r.stateLock.Unlock()
 	services := []*Service{}
 	r.withReadLock(func() error {
 		for _, service := range r.services.All() {
@@ -356,13 +431,19 @@ func (r *Router) saveStateSnapshot() error {
 
 	f, err := os.Create(r.statePath)
 	if err != nil {
+		slog.Error("Unable to save state snapshot", "error", err, "path", r.statePath)
 		return err
 	}
 
-	err = json.NewEncoder(f).Encode(services)
-	if err != nil {
-		slog.Error("Unable to save state", "error", err, "path", r.statePath)
-		return err
+	encodeErr := json.NewEncoder(f).Encode(services)
+	closeErr := f.Close()
+	if encodeErr != nil {
+		slog.Error("Unable to save state", "error", encodeErr, "path", r.statePath)
+		return encodeErr
+	}
+	if closeErr != nil {
+		slog.Error("Unable to close saved state", "error", closeErr, "path", r.statePath)
+		return closeErr
 	}
 
 	slog.Debug("Saved state", "path", r.statePath)

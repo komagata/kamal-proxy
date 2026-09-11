@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -48,6 +49,11 @@ func testTargetWithOptions(t testing.TB, targetOptions TargetOptions, handler ht
 	return target
 }
 
+func testRequestWithMatchedPrefix(req *http.Request, prefix string) *http.Request {
+	ctx := context.WithValue(req.Context(), contextKeyRoutingContext, &routingContext{MatchedPrefix: prefix})
+	return req.WithContext(ctx)
+}
+
 func testBackend(t testing.TB, body string, statusCode int) (*httptest.Server, string) {
 	t.Helper()
 
@@ -79,7 +85,7 @@ func testServer(t testing.TB, http3Enabled bool) *Server {
 		AlternateConfigDir: t.TempDir(),
 		HTTP3Enabled:       http3Enabled,
 	}
-	router := NewRouter(config.StatePath())
+	router := NewRouter(config.StatePath(), DefaultDockerSocketPath)
 	server := NewServer(config, router)
 	err := server.Start()
 	require.NoError(t, err)

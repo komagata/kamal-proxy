@@ -5,5 +5,7 @@ formatters:
     - gofmt
 
 linters:
+  enable:
+    - modernize
   disable:
     - errcheck

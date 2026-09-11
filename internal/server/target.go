@@ -12,7 +12,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 )
@@ -77,7 +76,7 @@ type TargetOptions struct {
 }
 
 func (to *TargetOptions) IsHealthCheckRequest(r *http.Request) bool {
-	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == to.HealthCheckConfig.Path
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && RoutedTargetPath(r) == to.HealthCheckConfig.Path
 }
 
 func (to *TargetOptions) canonicalizeLogHeaders() {
@@ -142,6 +141,14 @@ func NewReadOnlyTarget(targetURL string, options TargetOptions) (*Target, error)
 
 func (t *Target) Address() string {
 	return t.targetURL.Host
+}
+
+func (t *Target) ContainerName() string { return t.targetURL.Hostname() }
+
+func (t *Target) markUnhealthyForWake() {
+	t.inflightLock.Lock()
+	t.state = TargetStateUnhealthy
+	t.inflightLock.Unlock()
 }
 
 func (t *Target) State() TargetState {
@@ -218,15 +225,23 @@ WAIT_FOR_REQUESTS_TO_COMPLETE:
 
 func (t *Target) BeginHealthChecks(stateConsumer TargetStateConsumer) {
 	t.stateConsumer = stateConsumer
+	t.RestartHealthChecks()
+}
 
+func (t *Target) RestartHealthChecks() {
 	t.withInflightLock(func() {
+		if t.healthcheck != nil {
+			t.healthcheck.Close()
+		}
 		healthCheckURL := t.buildHealthCheckURL()
-		t.healthcheck = NewHealthCheck(t,
+		t.healthcheck = newHealthCheck(
+			t,
 			healthCheckURL,
 			t.options.HealthCheckConfig.Interval,
 			t.options.HealthCheckConfig.Timeout,
 			t.options.HealthCheckConfig.Host,
 		)
+		t.healthcheck.Start()
 	})
 }
 
@@ -310,10 +325,7 @@ func (t *Target) rewrite(req *httputil.ProxyRequest) {
 	req.SetURL(t.targetURL)
 	req.Out.Host = req.In.Host
 
-	routingContext := RoutingContext(req.In)
-	if routingContext != nil {
-		req.Out.URL.Path = strings.TrimPrefix(req.Out.URL.Path, routingContext.MatchedPrefix)
-	}
+	req.Out.URL.Path = RoutedTargetPath(req.In)
 
 	// Ensure query params are preserved exactly, including those we could not
 	// parse.
@@ -398,8 +410,7 @@ func (t *Target) isRequestEntityTooLarge(err error) bool {
 }
 
 func (t *Target) isGatewayTimeout(err error) bool {
-	var netErr net.Error
-	if errors.As(err, &netErr) {
+	if netErr, ok := errors.AsType[net.Error](err); ok {
 		return netErr.Timeout()
 	}
 	return false

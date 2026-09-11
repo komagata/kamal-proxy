@@ -2,7 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/basecamp/kamal-proxy/internal/pages"
 )
 
 func TestService_ServeRequest(t *testing.T) {
@@ -22,6 +27,198 @@ func TestService_ServeRequest(t *testing.T) {
 	service.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+}
+
+func TestService_StoppedRequestDoesNotWakeIdleContainer(t *testing.T) {
+	options := defaultServiceOptions
+	options.IdleTimeout = time.Minute
+	options.IdleWakeTimeout = time.Second
+	service := testCreateService(t, options, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	lifecycle := &fakeLifecycle{}
+	service.idleController.mu.Lock()
+	service.idleController.lifecycle = lifecycle
+	service.idleController.State = IdleStateSleeping
+	service.idleController.mu.Unlock()
+	require.NoError(t, service.pauseController.Stop(DefaultStopMessage))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Zero(t, lifecycle.starts.Load())
+}
+
+func TestService_RedirectDoesNotWakeIdleContainer(t *testing.T) {
+	options := ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true, TLSRedirect: true, IdleTimeout: time.Minute, IdleWakeTimeout: time.Second}
+	service := testCreateService(t, options, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	lifecycle := &fakeLifecycle{}
+	service.idleController.mu.Lock()
+	service.idleController.lifecycle = lifecycle
+	service.idleController.State = IdleStateSleeping
+	service.idleController.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusMovedPermanently, w.Code)
+	assert.Zero(t, lifecycle.starts.Load())
+}
+
+func TestService_InternalRequestDoesNotWakeIdleContainer(t *testing.T) {
+	options := defaultServiceOptions
+	options.IdleTimeout = time.Minute
+	options.IdleWakeTimeout = time.Second
+	service := testCreateService(t, options, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	lifecycle := &fakeLifecycle{}
+	service.idleController.mu.Lock()
+	service.idleController.lifecycle = lifecycle
+	service.idleController.State = IdleStateSleeping
+	service.idleController.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req = req.WithContext(markInternalRequest(req.Context()))
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	assert.Zero(t, lifecycle.starts.Load())
+}
+
+func TestService_WakeFailureDoesNotExposeLifecycleError(t *testing.T) {
+	options := defaultServiceOptions
+	options.IdleTimeout = time.Minute
+	options.IdleWakeTimeout = time.Second
+	service := testCreateService(t, options, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	lifecycle := &fakeLifecycle{startErr: errors.New("secret-container: permission denied on /var/run/docker.sock")}
+	service.idleController.mu.Lock()
+	service.idleController.lifecycle = lifecycle
+	service.idleController.State = IdleStateSleeping
+	service.idleController.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	w := httptest.NewRecorder()
+	handler, err := WithErrorPageMiddleware(pages.DefaultErrorPages, true, service)
+	require.NoError(t, err)
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.NotContains(t, w.Body.String(), "secret-container")
+	assert.NotContains(t, w.Body.String(), "docker.sock")
+	assert.Equal(t, "1", w.Header().Get("Retry-After"))
+}
+
+func TestService_HealthCheckReportsWakeFailure(t *testing.T) {
+	options := defaultServiceOptions
+	options.IdleTimeout = time.Minute
+	options.IdleWakeTimeout = time.Second
+	service := testCreateService(t, options, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	lifecycle := &fakeLifecycle{startErr: errors.New("start failed")}
+	service.idleController.mu.Lock()
+	service.idleController.lifecycle = lifecycle
+	service.idleController.State = IdleStateSleeping
+	service.idleController.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	healthReq := httptest.NewRequest(http.MethodGet, "http://example.com"+defaultTargetOptions.HealthCheckConfig.Path, nil)
+	healthResponse := httptest.NewRecorder()
+	service.ServeHTTP(healthResponse, healthReq)
+
+	assert.Equal(t, http.StatusServiceUnavailable, healthResponse.Code)
+}
+
+func TestService_WakeStartsActiveAndRolloutTargets(t *testing.T) {
+	options := defaultServiceOptions
+	options.IdleTimeout = time.Minute
+	options.IdleWakeTimeout = time.Second
+	service := testCreateServiceWithHandler(t, options, defaultTargetOptions, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("active"))
+	}))
+	t.Cleanup(service.Dispose)
+	_, rolloutTarget := testBackend(t, "rollout", http.StatusOK)
+	target, err := NewTarget(rolloutTarget, defaultTargetOptions)
+	require.NoError(t, err)
+	rollout := NewLoadBalancer(TargetList{target}, DefaultWriterAffinityTimeout, false)
+	require.NoError(t, rollout.WaitUntilHealthy(time.Second))
+	service.UpdateLoadBalancer(rollout, TargetSlotRollout)
+	require.NoError(t, service.SetRolloutSplit(100, nil))
+	require.NoError(t, service.EnableRollout())
+	lifecycle := &fakeLifecycle{}
+	service.idleController.mu.Lock()
+	service.idleController.lifecycle = lifecycle
+	service.idleController.State = IdleStateSleeping
+	service.idleController.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.AddCookie(&http.Cookie{Name: RolloutCookieName, Value: "1"})
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "rollout", w.Body.String())
+	assert.Equal(t, int32(2), lifecycle.starts.Load())
+}
+
+func TestService_WaitUntilIdleTargetsHealthyWithoutLoadBalancer(t *testing.T) {
+	options := defaultServiceOptions
+	options.IdleTimeout = time.Minute
+	service, err := NewService("test", options, defaultTargetOptions, &fakeLifecycle{})
+	require.NoError(t, err)
+	t.Cleanup(service.idleController.Close)
+
+	assert.ErrorIs(t, service.waitUntilIdleTargetsHealthy(time.Second), ErrorNoHealthyTargets)
+}
+
+func TestService_ClientIPHeaderRewritesXForwardedFor(t *testing.T) {
+	var xForwardedFor, trueClientIP string
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.ClientIPHeader = "True-Client-IP"
+
+	targetOptions := defaultTargetOptions
+	targetOptions.ForwardHeaders = true
+
+	service := testCreateServiceWithHandler(t, serviceOptions, targetOptions,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != defaultHealthCheckConfig.Path {
+				xForwardedFor = r.Header.Get("X-Forwarded-For")
+				trueClientIP = r.Header.Get("True-Client-IP")
+			}
+		}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("True-Client-IP", "203.0.113.9")
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+
+	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	require.Equal(t, "203.0.113.9, "+clientIP, xForwardedFor)
+	require.Equal(t, "203.0.113.9", trueClientIP)
+
+	// Without the trusted header, the client-supplied X-Forwarded-For is
+	// forwarded unmodified, as usual.
+	req = httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+
+	w = httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	require.Equal(t, "6.6.6.6, "+clientIP, xForwardedFor)
 }
 
 func TestService_RedirectToHTTPSWhenTLSRequired(t *testing.T) {
@@ -76,6 +273,19 @@ func TestServiceOptions_Validate(t *testing.T) {
 
 	assertNotValid(ServiceOptions{Hosts: []string{"example.com", "www.example.com"}, CanonicalHost: "api.example.com"}, "canonical-host 'api.example.com' must be present in the hosts list: [example.com www.example.com]")
 	assertValid(ServiceOptions{Hosts: []string{"example.com", "www.example.com"}, CanonicalHost: "www.example.com"})
+
+	assertValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host"})
+	assertValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "https://example.com/allow-host"})
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host", IdleTimeout: time.Minute}, "idle mode cannot be used with a local TLS on-demand URL")
+	assertValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "https://example.com/allow-host", IdleTimeout: time.Minute})
+	assertNotValid(ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true, TLSOnDemandURL: "/allow-host"}, "cannot set hosts when using a TLS on-demand URL")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "ftp://example.com/allow-host"}, "unsupported scheme")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "://invalid-url"}, "unable to parse tls-on-demand-url")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "//example.com/allow-host"}, "must be a path or an absolute http(s) URL")
+	assertNotValid(ServiceOptions{PathPrefixes: []string{"/api"}, TLSEnabled: true, TLSOnDemandURL: "/allow-host"}, "TLS settings must be specified on the root path service")
+	assertNotValid(ServiceOptions{TLSOnDemandURL: "/allow-host"}, "TLS must be enabled to use a TLS on-demand URL")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host", TLSCertificatePath: "cert.pem", TLSPrivateKeyPath: "key.pem"}, "cannot use a custom TLS certificate with a TLS on-demand URL")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host", CanonicalHost: "example.com"}, "cannot set a canonical host when using a TLS on-demand URL")
 }
 
 func TestService_DontRedirectToHTTPSWhenTLSAndPlainHTTPAllowed(t *testing.T) {
@@ -166,6 +376,45 @@ func TestService_ReturnSuccessfulHealthCheckWhilePausedOrStopped(t *testing.T) {
 	assert.Equal(t, http.StatusOK, checkRequest("/other"))
 }
 
+func TestServiceOptions_ShouldExcludeMetrics(t *testing.T) {
+	options := ServiceOptions{ExcludeMetricsPaths: []string{"/up", "/healthz"}}
+
+	assert.True(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/up", nil)))
+	assert.True(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodPost, "/healthz", nil)))
+	assert.False(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/api/users", nil)))
+	assert.False(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/up/nested", nil)))
+
+	// When a path prefix is due to be stripped, match against the target's view of the path
+	assert.True(t, options.ShouldExcludeMetrics(testRequestWithMatchedPrefix(httptest.NewRequest(http.MethodGet, "/api/up", nil), "/api")))
+	assert.False(t, options.ShouldExcludeMetrics(testRequestWithMatchedPrefix(httptest.NewRequest(http.MethodGet, "/api/users", nil), "/api")))
+	assert.False(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/api/up", nil)))
+
+	empty := ServiceOptions{}
+	assert.False(t, empty.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/up", nil)))
+}
+
+func TestService_ExcludeMetricsPathsMarksRequestContext(t *testing.T) {
+	options := defaultServiceOptions
+	options.ExcludeMetricsPaths = []string{"/up", "/metrics"}
+
+	service := testCreateService(t, options, defaultTargetOptions)
+
+	checkExcluded := func(path string) bool {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		ctx := &loggingRequestContext{}
+		req = req.WithContext(context.WithValue(req.Context(), contextKeyRequestContext, ctx))
+
+		w := httptest.NewRecorder()
+		service.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Result().StatusCode)
+		return ctx.ExcludeMetrics
+	}
+
+	assert.True(t, checkExcluded("/up"))
+	assert.True(t, checkExcluded("/metrics"))
+	assert.False(t, checkExcluded("/other"))
+}
+
 func TestService_MarshallingState(t *testing.T) {
 	targetOptions := TargetOptions{
 		HealthCheckConfig:   HealthCheckConfig{Path: "/health", Interval: time.Second, Timeout: 2 * time.Second},
@@ -179,6 +428,7 @@ func TestService_MarshallingState(t *testing.T) {
 	service.UpdateLoadBalancer(NewLoadBalancer(service.active.Targets(), DefaultWriterAffinityTimeout, false), TargetSlotRollout)
 
 	require.NoError(t, service.SetRolloutSplit(20, []string{"first"}))
+	require.NoError(t, service.EnableRollout())
 
 	var buf bytes.Buffer
 	err := json.NewEncoder(&buf).Encode(service)
@@ -198,6 +448,52 @@ func TestService_MarshallingState(t *testing.T) {
 
 	assert.Equal(t, 20, service2.rolloutController.Percentage)
 	assert.Equal(t, []string{"first"}, service2.rolloutController.Allowlist)
+	assert.True(t, service2.rolloutController.Enabled)
+}
+
+func TestService_MarshallingStateAfterRemovingRollout(t *testing.T) {
+	service := testCreateService(t, defaultServiceOptions, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	service.UpdateLoadBalancer(NewLoadBalancer(service.active.Targets(), DefaultWriterAffinityTimeout, false), TargetSlotRollout)
+	require.NoError(t, service.SetRolloutSplit(20, []string{"first"}))
+
+	removed, err := service.RemoveRollout()
+	require.NoError(t, err)
+	removed.Dispose()
+
+	var buf bytes.Buffer
+	require.NoError(t, json.NewEncoder(&buf).Encode(service))
+
+	var service2 Service
+	require.NoError(t, json.NewDecoder(&buf).Decode(&service2))
+	t.Cleanup(service2.Dispose)
+
+	assert.Nil(t, service2.rollout)
+	assert.Nil(t, service2.rolloutController)
+}
+
+func TestService_RemovingRolloutWhileDrainingAndMarshalling(t *testing.T) {
+	service := testCreateService(t, defaultServiceOptions, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+
+	for range 50 {
+		targets, err := NewTargetList(nil, nil, defaultTargetOptions)
+		require.NoError(t, err)
+		service.UpdateLoadBalancer(NewLoadBalancer(targets, DefaultWriterAffinityTimeout, false), TargetSlotRollout)
+
+		PerformConcurrently(
+			func() { service.Drain(time.Second) },
+			func() { service.Dispose() },
+			func() { _, _ = json.Marshal(service) },
+			func() {
+				removed, err := service.RemoveRollout()
+				require.NoError(t, err)
+				removed.Dispose()
+			},
+		)
+	}
+
+	assert.Nil(t, service.rollout)
 }
 
 func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
@@ -252,6 +548,17 @@ func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
 	assert.Equal(t, 3*time.Second, service.targetOptions.ResponseTimeout)
 }
 
+func TestNewServiceWithIdleLifecycleBeforeActiveLoadBalancer(t *testing.T) {
+	service, err := NewService("test", ServiceOptions{
+		IdleTimeout:     time.Minute,
+		IdleWakeTimeout: time.Second,
+	}, defaultTargetOptions, &fakeLifecycle{})
+	require.NoError(t, err)
+	t.Cleanup(service.idleController.Close)
+
+	assert.Empty(t, service.idleController.ContainerNames)
+}
+
 func testCreateService(t *testing.T, options ServiceOptions, targetOptions TargetOptions) *Service {
 	return testCreateServiceWithHandler(
 		t, options, targetOptions,
@@ -269,7 +576,7 @@ func testCreateServiceWithHandler(t *testing.T, options ServiceOptions, targetOp
 	target, err := NewTarget(serverURL.Host, targetOptions)
 	require.NoError(t, err)
 
-	service, err := NewService("test", options, targetOptions)
+	service, err := NewService("test", options, targetOptions, &fakeLifecycle{})
 	require.NoError(t, err)
 
 	service.UpdateLoadBalancer(NewLoadBalancer(TargetList{target}, DefaultWriterAffinityTimeout, false), TargetSlotActive)
