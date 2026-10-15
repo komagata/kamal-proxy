@@ -5,11 +5,13 @@ import (
 	"os"
 	"path"
 	"syscall"
+	"time"
 )
 
 const (
-	DefaultHttpPort  = 80
-	DefaultHttpsPort = 443
+	DefaultHttpPort         = 80
+	DefaultHttpsPort        = 443
+	DefaultDockerSocketPath = "/var/run/docker.sock"
 )
 
 type Config struct {
@@ -19,11 +21,16 @@ type Config struct {
 	MetricsPort  int
 	HTTP3Enabled bool
 
+	ReadHeaderTimeout  time.Duration
+	IdleTimeout        time.Duration
+	RequestBodyTimeout time.Duration
+
 	AlternateConfigDir string
+	DockerSocketPath   string
 }
 
 func (c Config) SocketPath() string {
-	return path.Join(c.runtimeDirectory(), "kamal-proxy.sock")
+	return cmp.Or(os.Getenv("KAMAL_PROXY_SOCKET"), path.Join(c.runtimeDirectory(), "kamal-proxy.sock"))
 }
 
 func (c Config) StatePath() string {

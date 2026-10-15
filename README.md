@@ -50,6 +50,44 @@ Each deployment takes over all the traffic from the previously deployed
 instance. As soon as Kamal Proxy determines that the new instance is healthy,
 it will route all new traffic to that instance.
 
+### Opt-in scale to zero
+
+Services can stop their write containers after an idle period and wake them on
+the next application request:
+
+    kamal-proxy run --docker-socket /var/run/docker.sock
+    kamal-proxy deploy service1 --target web-1:3000 --idle-timeout 15m --idle-wake-timeout 30s
+
+`--idle-timeout` defaults to `0` (disabled). `--idle-wake-timeout` defaults to
+`30s` and bounds how long each request waits for Docker start and a successful
+configured health check. The target hostname (`web-1` above) must be the Docker
+container name. `DOCKER_SOCKET` and `KAMAL_PROXY_DOCKER_SOCKET` are equivalents
+of the run flag.
+
+Requests are held before their bodies are read, so POST bodies are forwarded
+unchanged after a successful wake. Concurrent wake requests are coalesced.
+Open streaming responses and WebSockets count as activity/in-flight work and
+prevent sleeping until they close; a new stream or WebSocket is held during
+wake like any other request. Health-check requests do not wake or reset an idle
+service and receive success while it is stopping, sleeping, or waking. After a
+wake failure, health checks return `503` until a later request wakes the service
+successfully. Lifecycle errors are logged but are not exposed in HTTP responses.
+
+Idle mode cannot be combined with a local `--tls-on-demand-url` path because the
+internal authorization request would need the sleeping application to be awake.
+An absolute external TLS authorization URL remains supported.
+
+Mounting the Docker socket gives the proxy host-level container control. Only
+enable this feature where that trust is acceptable; the lifecycle calls are
+isolated behind the `ContainerLifecycle` interface so they can be moved to an
+external service later.
+
+The Docker client negotiates the API version once from the daemon's unversioned
+`/version` endpoint and caches it for start/stop calls. If that endpoint is
+unavailable or returns a non-success status, it falls back to the legacy
+`v1.41` paths for compatibility with restricted socket proxies; a successful
+but malformed version response is rejected instead of guessing.
+
 The `deploy` command also waits for traffic to drain from the old instance before
 returning. This means it's safe to remove the old instance as soon as `deploy`
 returns successfully, without interrupting any in-flight requests.
@@ -118,6 +156,35 @@ the original path (including the prefix), specify `--strip-path-prefix=false`:
 
     kamal-proxy deploy service1 --target web-1:3000 --path-prefix=/api --strip-path-prefix=false
 
+Path prefixes are matched against the request path after resolving `.` and
+`..` segments and collapsing repeated slashes, so `/other/../api/users` is
+routed to the `/api` service. When the prefix is stripped, the upstream
+receives that cleaned path with the prefix removed. Otherwise the path is
+forwarded exactly as it was sent.
+
+
+### Excluding paths from metrics
+
+When metrics are enabled (with `--metrics-port`), every request handled by
+the proxy is recorded in the Prometheus output. High-volume traffic from
+upstream load balancers or uptime monitors hitting health endpoints can
+both inflate the metrics pipeline and dominate aggregate measures like
+request rate, latency percentiles, and error rates, making the resulting
+metrics a poor reflection of real user traffic.
+
+To exclude one or more paths from the metrics for a service, use
+`--exclude-metrics-path` when deploying. The flag may be repeated, and
+matches are exact:
+
+    kamal-proxy deploy service1 --target web-1:3000 --exclude-metrics-path /up --exclude-metrics-path /healthz
+
+Excluded requests are still logged; only the Prometheus counters and
+in-flight gauge are skipped.
+
+Paths are specified as the upstream receives them. Services deployed using
+stripped path prefixes should specify their excluded paths in the un-prefixed
+form.
+
 
 ### Automatic TLS
 
@@ -134,6 +201,33 @@ root path. Services deployed to other paths on the same host will use the same
 TLS settings as those specified for the root path.
 
 
+### On-demand TLS
+
+Instead of specifying a static list of hosts, Kamal Proxy can also obtain TLS
+certificates dynamically, for any host approved by an HTTP endpoint of your
+choice. This is useful when the full set of hosts is not known at deploy time,
+such as when serving customer domains.
+
+To enable this, specify `--tls-on-demand-url` (instead of `--host`) when
+deploying:
+
+    kamal-proxy deploy service1 --target web-1:3000 --tls --tls-on-demand-url="http://localhost:4567/check"
+
+The URL may be:
+
+- An external URL (like `http://localhost:4567/check`), which Kamal Proxy will
+  call directly, or
+- A path (like `/check`), which Kamal Proxy will route through the service to
+  your application, letting the application decide which hosts to allow.
+
+Before issuing a certificate for a host, Kamal Proxy will send a `GET` request
+to the endpoint, with the hostname in a `host` query parameter (for example,
+`?host=app1.example.com`) and matching `Host` header. A `200` response allows
+certificate issuance; any other response denies it, and the status code and up
+to 256 bytes of the response body are logged to help with debugging. Checks
+time out after 2 seconds, denying issuance for that attempt.
+
+
 ### Custom TLS certificate
 
 When you obtained your TLS certificate manually, manage your own certificate authority,
@@ -141,6 +235,28 @@ or need to install Cloudflare origin certificate, you can manually specify path 
 your certificate file and the corresponding private key:
 
     kamal-proxy deploy service1 --target web-1:3000 --host app1.example.com --tls --tls-certificate-path cert.pem --tls-private-key-path key.pem
+
+
+## Client timeouts
+
+Kamal Proxy closes connections from clients that stop sending data, so that
+slow or stalled clients cannot hold connections open indefinitely. Three
+timeouts apply, each configurable with a `run` option:
+
+- `--read-header-timeout` (default `10s`) bounds the time a client has to send
+  its request headers. It also bounds the TLS handshake.
+- `--idle-timeout` (default `60s`) bounds how long a keep-alive connection may
+  sit idle between requests.
+- `--request-body-timeout` (default `60s`) bounds how long the proxy waits for
+  a client to send more of its request body. The timer restarts with each read
+  of the body, so it limits stalls rather than total upload time. A client
+  that stalls while its body is being forwarded receives a `408 Request
+  Timeout`. If the response was already sent without reading the body (for
+  example a `404` or a redirect), the connection is closed instead.
+
+Setting a timeout to `0` disables it. These timeouts apply to all services;
+`--target-timeout` on `deploy` is separate, and bounds how long the proxy waits
+for a target to respond.
 
 
 ## Specifying `run` options with environment variables
